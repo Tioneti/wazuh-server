@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Resume this development stack without rebuilding or regenerating certificates.
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+action=${1:-start}
+case "$action" in start|stop|status) ;; *) echo 'Usage: ./wazuh [start|stop|status]' >&2; exit 2 ;; esac
+command -v docker >/dev/null || { echo 'Docker is not installed.' >&2; exit 1; }
+if [[ "$action" == start ]] && ! docker info >/dev/null 2>&1; then
+  echo 'Starting Docker...'
+  if ! command -v systemctl >/dev/null; then
+    echo 'Start Docker manually, then run ./wazuh start again.' >&2
+    exit 1
+  fi
+  if (( EUID == 0 )); then
+    systemctl start docker
+  else
+    sudo systemctl start docker
+  fi
+  for ((attempt=0; attempt<30; attempt++)); do
+    if docker info >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+fi
+if ! docker info >/dev/null; then
+  echo 'Cannot access Docker. Check that Docker is running and your user has permission to use it.' >&2
+  exit 1
+fi
+projects=()
+while IFS= read -r container; do
+  workdir=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$container")
+  if [[ "$workdir" -ef "$root/wazuh-dashboard-plugins/docker/osd-dev" ]]; then
+    projects+=("$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$container")")
+  fi
+done < <(docker ps -aq --filter label=com.docker.compose.service=osd)
+if [[ ${#projects[@]} != 1 ]]; then
+  echo 'Expected one existing Wazuh development stack for this workspace. No containers changed.' >&2
+  exit 1
+fi
+project=${projects[0]}
+containers=()
+indexer=''
+dashboard=''
+while IFS= read -r container; do
+  service=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$container")
+  case "$service" in
+    generator|idpsec|idpsetup|dashboard-src-installer) continue ;;
+    os1) indexer=$container ;;
+    osd) dashboard=$container ;;
+  esac
+  containers+=("$container")
+done < <(docker ps -aq --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.oneoff=False)
+if [[ "$action" == stop ]]; then
+  docker stop "${containers[@]}"
+  exit
+fi
+if [[ "$action" == start ]]; then
+  [[ -n "$indexer" && -n "$dashboard" ]] || { echo 'Missing indexer or dashboard container.' >&2; exit 1; }
+  docker start "$indexer" >/dev/null
+  echo 'Waiting for the indexer health check...'
+  ready=0
+  for ((attempt=0; attempt<90; attempt++)); do
+    if [[ $(docker inspect -f '{{.State.Health.Status}}' "$indexer") == healthy ]]; then
+      ready=1
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$ready" != 1 ]]; then
+    docker inspect -f '{{json .State.Health}}' "$indexer"
+    echo 'Indexer is unhealthy. Inspect its logs before restarting other services.' >&2
+    exit 1
+  fi
+  docker start "${containers[@]}" >/dev/null
+  if ! docker exec "$dashboard" sh -c 'ps -eo args | grep -q "[n]ode scripts/opensearch_dashboards"'; then
+    docker exec -d "$dashboard" bash -c 'cd /home/node/kbn && exec yarn start --no-base-path > /tmp/wazuh-dev.log 2>&1'
+  fi
+  echo 'Waiting for the dashboard (development compilation can take a few minutes)...'
+  docker exec "$dashboard" sh -c '
+    for attempt in $(seq 1 180); do
+      code=$(curl --max-time 3 -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5601/ || true)
+      case "$code" in 200|302) exit 0 ;; esac
+      sleep 2
+    done
+    tail -30 /tmp/wazuh-dev.log
+    exit 1
+  '
+  echo 'Wazuh login: http://localhost:5601 (default: admin / admin)'
+fi
+docker ps -a --filter "label=com.docker.compose.project=$project" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'

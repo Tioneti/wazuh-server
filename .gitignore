@@ -1,0 +1,17 @@
+# Local metadata and preserved upstream history
+/.agents/
+/.aws/
+/.codex/
+**/.git.upstream-backup/
+# Dependencies, runtime output, and private configuration
+node_modules/
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+.local-backups/
